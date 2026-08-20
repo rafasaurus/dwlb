@@ -86,7 +86,7 @@
 	"	-no-custom-title		display current window title as normal\n" \
 	"	-active-color-title		title colors will use active colors\n" \
 	"	-no-active-color-title		title colors will use inactive colors\n" \
-	"	-font [FONT]			specify a font\n"	\
+	"	-font [FONT]			specify a font, or a comma separated list of a font and its fallbacks\n"	\
 	"	-tags [NUMBER] [FIRST]...[LAST]	if ipc is disabled, specify custom tag names. If NUMBER is 0, then no tag names should be given \n" \
 	"	-vertical-padding [PIXELS]	specify vertical pixel padding above and below text\n" \
 	"	-active-fg-color [COLOR]	specify text color of active tags or monitors\n" \
@@ -99,7 +99,7 @@
 	"	-urgent-bg-color [COLOR]	specify background color of urgent tags\n" \
 	"	-middle-bg-color [COLOR]	specify background color of the color in the middle of the bar\n" \
 	"	-middle-bg-color-selected [COLOR]	specify background color of the color in the middle of the bar, when selected\n" \
-	"	-scale [BUFFER_SCALE]		specify buffer scale value for integer scaling\n" \
+	"	-scale [BUFFER_SCALE]		force this buffer scale on every output instead of following each output's own scale\n" \
 	"Commands\n"							\
 	"	-target-socket [SOCKET-NAME]	set the socket to send command to. Sockets can be found in `$XDG_RUNTIME_DIR/dwlb/`\n"\
 	"	-status	[OUTPUT] [TEXT]		set status text\n"	\
@@ -153,6 +153,10 @@ typedef struct {
 	bool configured;
 	uint32_t width, height;
 	uint32_t textpadding;
+	/* scale of the output this bar lives on, and the font sized for it */
+	uint32_t scale, pending_scale;
+	uint32_t hmin;
+	struct fcft_font *font;
 	uint32_t stride, bufsize;
 	
 	uint32_t mtags, ctags, urg, sel;
@@ -194,8 +198,6 @@ static struct zwlr_layer_shell_v1 *layer_shell;
 static struct zxdg_output_manager_v1 *output_manager;
 
 static struct zdwl_ipc_manager_v2 *dwl_wm;
-static struct wl_cursor_image *cursor_image;
-static struct wl_surface *cursor_surface;
 
 static struct wl_list bar_list, seat_list;
 
@@ -204,12 +206,113 @@ static uint32_t tags_l, tags_c;
 static char **layouts;
 static uint32_t layouts_l, layouts_c;
 
-static struct fcft_font *font;
-static uint32_t height, textpadding, buffer_scale;
+/* Everything that depends on an output's scale factor. Outputs sharing a
+ * scale share one entry; entries are created on demand and live until exit. */
+typedef struct {
+	uint32_t scale;
+	struct fcft_font *font;
+	uint32_t textpadding;
+	uint32_t hmin;   /* logical bar height this scale needs at minimum */
+	struct wl_cursor_image *cursor_image;
+	struct wl_surface *cursor_surface;
+} ScaleCtx;
+
+static ScaleCtx *scales;
+static uint32_t scales_l, scales_c;
+
+/* Logical height shared by every bar. Bitmap fonts snap to whatever strike is
+ * closest, so a scale-2 output's font is rarely exactly twice as tall as a
+ * scale-1 one's; taking the max keeps the bars the same apparent height. */
+static uint32_t bar_height;
+
+/* 0 means "follow each output's scale"; nonzero forces that scale everywhere */
+static uint32_t buffer_scale;
 
 static bool run_display;
 
 #include "config.h"
+
+/* DIE/EDIE, used by the array macros below, call this */
+static void cleanup(void);
+
+/* fontstr split on commas: the primary font followed by its fallbacks */
+static char **fontnames;
+static uint32_t fontnames_l, fontnames_c;
+
+/* fcft wants the primary font and its fallbacks as separate names, so split
+ * the comma separated -font value instead of handing the whole thing to
+ * fontconfig, which quietly drops everything after the first entry. */
+static void
+parse_fontstr(void)
+{
+	char *buf = strdup(fontstr);
+	if (!buf)
+		EDIE("strdup");
+
+	char *start = buf;
+	for (char *p = buf;; p++) {
+		/* fontconfig escapes commas inside family names */
+		if (*p == '\\' && p[1]) {
+			p++;
+			continue;
+		}
+		if (*p != ',' && *p != '\0')
+			continue;
+
+		bool last = *p == '\0';
+		*p = '\0';
+
+		while (*start == ' ' || *start == '\t')
+			start++;
+		for (char *e = start + strlen(start); e > start && (e[-1] == ' ' || e[-1] == '\t'); e--)
+			e[-1] = '\0';
+
+		if (*start) {
+			char **slot;
+			ARRAY_APPEND(fontnames, fontnames_l, fontnames_c, slot);
+			*slot = start;
+		}
+
+		if (last)
+			break;
+		start = p + 1;
+	}
+
+	if (!fontnames_l)
+		DIE("No font specified");
+}
+
+static ScaleCtx *
+get_scale_ctx(uint32_t scale)
+{
+	if (scale < 1)
+		scale = 1;
+
+	for (uint32_t i = 0; i < scales_l; i++)
+		if (scales[i].scale == scale)
+			return &scales[i];
+
+	/* Ask fontconfig for the font at this output's dpi, so a scale-2
+	 * output gets glyphs rasterized at twice the pixel size instead of a
+	 * scale-1 buffer the compositor has to stretch. */
+	char attrs[32];
+	snprintf(attrs, sizeof attrs, "dpi=%u", 96 * scale);
+
+	struct fcft_font *f = fcft_from_name(fontnames_l, (const char **)fontnames, attrs);
+	if (!f)
+		return NULL;
+
+	ScaleCtx *ctx;
+	ARRAY_APPEND(scales, scales_l, scales_c, ctx);
+	*ctx = (ScaleCtx){
+		.scale = scale,
+		.font = f,
+		.textpadding = f->height / 2,
+		.hmin = f->height / scale + vertical_padding * 2,
+	};
+
+	return ctx;
+}
 
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
@@ -240,8 +343,40 @@ allocate_shm_file(size_t size)
 	return fd;
 }
 
+/* Downscale a pre-rendered glyph into a fresh image of at most max_h pixels */
+static pixman_image_t *
+fit_glyph(pixman_image_t *src, int sw, int sh, int max_h, int *dw, int *dh)
+{
+	double factor = (double)max_h / sh;
+	int nw = sw * factor;
+
+	if (nw < 1 || max_h < 1)
+		return NULL;
+
+	pixman_image_t *dst = pixman_image_create_bits(PIXMAN_a8r8g8b8, nw, max_h,
+						       NULL, nw * 4);
+	if (!dst)
+		return NULL;
+
+	struct pixman_transform t;
+	pixman_transform_init_scale(&t, pixman_double_to_fixed(1.0 / factor),
+				    pixman_double_to_fixed(1.0 / factor));
+	pixman_image_set_transform(src, &t);
+	pixman_image_set_filter(src, PIXMAN_FILTER_BILINEAR, NULL, 0);
+	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, dst,
+				 0, 0, 0, 0, 0, 0, nw, max_h);
+	/* src belongs to fcft's glyph cache, so put it back as we found it */
+	pixman_image_set_transform(src, NULL);
+	pixman_image_set_filter(src, PIXMAN_FILTER_NEAREST, NULL, 0);
+
+	*dw = nw;
+	*dh = max_h;
+	return dst;
+}
+
 static uint32_t
-draw_text(char *text,
+draw_text(struct fcft_font *font,
+	  char *text,
 	  uint32_t x,
 	  uint32_t y,
 	  pixman_image_t *foreground,
@@ -312,11 +447,28 @@ draw_text(char *text,
 		x += kern;
 
 		if (draw_fg) {
+			pixman_image_t *gpix = glyph->pix, *fitted = NULL;
+			int gx = x + glyph->x, gy = (int)y - glyph->y;
+			int gw = glyph->width, gh = glyph->height;
+
 			/* Detect and handle pre-rendered glyphs (e.g. emoji) */
 			if (pixman_image_get_format(glyph->pix) == PIXMAN_a8r8g8b8) {
+				/* A colour fallback font is rasterized at the
+				 * nominal pixel size, which need not match the
+				 * primary font's extents -- a bitmap font snaps
+				 * to a strike, a scalable emoji font does not.
+				 * Centre these in the bar, and shrink the ones
+				 * that would not fit, instead of letting them
+				 * spill past the top edge. */
+				if (gh > (int)buf_height)
+					if ((fitted = fit_glyph(glyph->pix, gw, gh,
+								buf_height, &gw, &gh)))
+						gpix = fitted;
+				gy = ((int)buf_height - gh) / 2;
+
 				pixman_image_composite32(
-					PIXMAN_OP_OVER, glyph->pix, NULL, foreground, 0, 0, 0, 0,
-					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+					PIXMAN_OP_OVER, gpix, NULL, foreground, 0, 0, 0, 0,
+					gx, gy, gw, gh);
 			} else {
 				pixman_image_fill_boxes(PIXMAN_OP_OVER, foreground,
 					cur_fg_color, 1, &(pixman_box32_t){
@@ -325,8 +477,11 @@ draw_text(char *text,
 					});
 			}
 			pixman_image_composite32(
-				PIXMAN_OP_OVER, glyph->pix, fg_mask_fill, foreground_mask, 0, 0, 0, 0,
-				x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+				PIXMAN_OP_OVER, gpix, fg_mask_fill, foreground_mask, 0, 0, 0, 0,
+				gx, gy, gw, gh);
+
+			if (fitted)
+				pixman_image_unref(fitted);
 		}
 		
 		if (draw_bg) {
@@ -364,8 +519,8 @@ draw_text(char *text,
 	return nx;
 }
 
-#define TEXT_WIDTH(text, maxwidth, padding)				\
-	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, NULL, maxwidth, 0, padding, NULL, 0)
+#define TEXT_WIDTH(font, text, maxwidth, padding)			\
+	draw_text(font, text, 0, 0, NULL, NULL, NULL, NULL, NULL, maxwidth, 0, padding, NULL, 0)
 
 static int
 draw_frame(Bar *bar)
@@ -397,9 +552,9 @@ draw_frame(Bar *bar)
 	
 	/* Draw on images */
 	uint32_t x = 0;
-	uint32_t y = (bar->height + font->ascent - font->descent) / 2;
-	uint32_t boxs = font->height / 9;
-	uint32_t boxw = font->height / 6 + 2;
+	uint32_t y = (bar->height + bar->font->ascent - bar->font->descent) / 2;
+	uint32_t boxs = bar->font->height / 9;
+	uint32_t boxw = bar->font->height / 6 + 2;
 
 	for (uint32_t i = 0; i < tags_l; i++) {
 		const bool active = bar->mtags & 1 << i;
@@ -441,23 +596,23 @@ draw_frame(Bar *bar)
 			}
 		}
 		
-		x = draw_text(tags[i], x, y, foreground, foreground_mask, background, fg_color, bg_color,
+		x = draw_text(bar->font, tags[i], x, y, foreground, foreground_mask, background, fg_color, bg_color,
 			      bar->width, bar->height, bar->textpadding, NULL, 0);
 	}
 	
-	x = draw_text(bar->layout, x, y, foreground, foreground_mask, background,
+	x = draw_text(bar->font, bar->layout, x, y, foreground, foreground_mask, background,
 		      &inactive_fg_color, &inactive_bg_color, bar->width,
 		      bar->height, bar->textpadding, NULL, 0);
 	
-	uint32_t status_width = TEXT_WIDTH(bar->status.text, bar->width - x, bar->textpadding);
-	draw_text(bar->status.text, bar->width - status_width, y, foreground, foreground_mask,
+	uint32_t status_width = TEXT_WIDTH(bar->font, bar->status.text, bar->width - x, bar->textpadding);
+	draw_text(bar->font, bar->status.text, bar->width - status_width, y, foreground, foreground_mask,
 		  background, &inactive_fg_color, &inactive_bg_color,
 		  bar->width, bar->height, bar->textpadding,
 		  bar->status.colors, bar->status.colors_l);
 
 	uint32_t nx;
 	if (center_title) {
-		uint32_t title_width = TEXT_WIDTH(custom_title ? bar->title.text : bar->window_title, bar->width - status_width - x, 0);
+		uint32_t title_width = TEXT_WIDTH(bar->font, custom_title ? bar->title.text : bar->window_title, bar->width - status_width - x, 0);
 		nx = MAX(x, MIN((bar->width - title_width) / 2, bar->width - status_width - title_width));
 	} else {
 		nx = MIN(x + bar->textpadding, bar->width - status_width);
@@ -477,7 +632,7 @@ draw_frame(Bar *bar)
 		title_text = floating_title;
 	}
 
-	x = draw_text(title_text,
+	x = draw_text(bar->font, title_text,
 		      x, y, foreground, foreground_mask, background,
 		      (bar->sel && active_color_title) ? &active_fg_color : &inactive_fg_color,
 		      (bar->sel && active_color_title) ? &active_bg_color : &inactive_bg_color,
@@ -504,7 +659,7 @@ draw_frame(Bar *bar)
 	
 	munmap(data, bar->bufsize);
 
-	wl_surface_set_buffer_scale(bar->wl_surface, buffer_scale);
+	wl_surface_set_buffer_scale(bar->wl_surface, bar->scale);
 	wl_surface_attach(bar->wl_surface, buffer, 0, 0);
 	wl_surface_damage_buffer(bar->wl_surface, 0, 0, bar->width, bar->height);
 	wl_surface_commit(bar->wl_surface);
@@ -517,12 +672,12 @@ static void
 layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
 			uint32_t serial, uint32_t w, uint32_t h)
 {
-	w = w * buffer_scale;
-	h = h * buffer_scale;
-
 	zwlr_layer_surface_v1_ack_configure(surface, serial);
 	
 	Bar *bar = (Bar *)data;
+
+	w = w * bar->scale;
+	h = h * bar->scale;
 	
 	if (bar->configured && w == bar->width && h == bar->height)
 		return;
@@ -621,21 +776,36 @@ pointer_enter(void *data, struct wl_pointer *pointer,
 		}
 	}
 
-	if (!cursor_image) {
+	if (!seat->bar)
+		return;
+
+	/* A cursor loaded for scale 1 would be stretched on a hidpi output, so
+	 * keep one cursor per scale alongside the font */
+	ScaleCtx *ctx = get_scale_ctx(seat->bar->scale);
+	if (!ctx)
+		return;
+
+	if (!ctx->cursor_image) {
 		const char *size_str = getenv("XCURSOR_SIZE");
 		int size = size_str ? atoi(size_str) : 0;
 		if (size == 0)
 			size = 24;
-		struct wl_cursor_theme *cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size * buffer_scale, shm);
-		cursor_image = wl_cursor_theme_get_cursor(cursor_theme, "left_ptr")->images[0];
-		cursor_surface = wl_compositor_create_surface(compositor);
-		wl_surface_set_buffer_scale(cursor_surface, buffer_scale);
-		wl_surface_attach(cursor_surface, wl_cursor_image_get_buffer(cursor_image), 0, 0);
-		wl_surface_commit(cursor_surface);
+		struct wl_cursor_theme *cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size * ctx->scale, shm);
+		if (!cursor_theme)
+			return;
+		struct wl_cursor *cursor = wl_cursor_theme_get_cursor(cursor_theme, "left_ptr");
+		if (!cursor || !cursor->image_count)
+			return;
+		ctx->cursor_image = cursor->images[0];
+		ctx->cursor_surface = wl_compositor_create_surface(compositor);
+		wl_surface_set_buffer_scale(ctx->cursor_surface, ctx->scale);
+		wl_surface_attach(ctx->cursor_surface, wl_cursor_image_get_buffer(ctx->cursor_image), 0, 0);
+		wl_surface_commit(ctx->cursor_surface);
 	}
-	wl_pointer_set_cursor(pointer, serial, cursor_surface,
-			      cursor_image->hotspot_x,
-			      cursor_image->hotspot_y);
+	/* hotspot is in surface-local (logical) coordinates */
+	wl_pointer_set_cursor(pointer, serial, ctx->cursor_surface,
+			      ctx->cursor_image->hotspot_x / ctx->scale,
+			      ctx->cursor_image->hotspot_y / ctx->scale);
 }
 
 static void
@@ -674,6 +844,11 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 	if (!seat->pointer_button || !seat->bar)
 		return;
 
+	/* Pointer coordinates are surface-local, i.e. logical pixels, while the
+	 * bar's geometry is in device pixels. Convert once and compare in
+	 * device pixels throughout. */
+	uint32_t ptr_x = seat->pointer_x * seat->bar->scale;
+
 	uint32_t x = 0, i = 0;
 	do {
 		if (hide_vacant) {
@@ -683,8 +858,8 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 			if (!active && !occupied && !urgent)
 				continue;
 		}
-		x += TEXT_WIDTH(tags[i], seat->bar->width - x, seat->bar->textpadding) / buffer_scale;
-	} while (seat->pointer_x >= x && ++i < tags_l);
+		x += TEXT_WIDTH(seat->bar->font, tags[i], seat->bar->width - x, seat->bar->textpadding);
+	} while (ptr_x >= x && ++i < tags_l);
 
 	if (i < tags_l) {
 		/* Clicked on tags */
@@ -696,7 +871,7 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 			else if (seat->pointer_button == BTN_RIGHT)
 				zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, seat->bar->mtags ^ (1 << i), 0);
 		}
-	} else if (seat->pointer_x < (x += TEXT_WIDTH(seat->bar->layout, seat->bar->width - x, seat->bar->textpadding))) {
+	} else if (ptr_x < (x += TEXT_WIDTH(seat->bar->font, seat->bar->layout, seat->bar->width - x, seat->bar->textpadding))) {
 		/* Clicked on layout */
 		if (ipc) {
 			if (seat->pointer_button == BTN_LEFT)
@@ -705,20 +880,20 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 				zdwl_ipc_output_v2_set_layout(seat->bar->dwl_wm_output, 2);
 		}
 	} else {
-		uint32_t status_x = seat->bar->width / buffer_scale - TEXT_WIDTH(seat->bar->status.text, seat->bar->width - x, seat->bar->textpadding) / buffer_scale;
-		if (seat->pointer_x < status_x) {
+		uint32_t status_x = seat->bar->width - TEXT_WIDTH(seat->bar->font, seat->bar->status.text, seat->bar->width - x, seat->bar->textpadding);
+		if (ptr_x < status_x) {
 			/* Clicked on title */
 			if (custom_title) {
 				if (center_title) {
-					uint32_t title_width = TEXT_WIDTH(seat->bar->title.text, status_x - x, 0);
+					uint32_t title_width = TEXT_WIDTH(seat->bar->font, seat->bar->title.text, status_x - x, 0);
 					x = MAX(x, MIN((seat->bar->width - title_width) / 2, status_x - title_width));
 				} else {
 					x = MIN(x + seat->bar->textpadding, status_x);
 				}
 				for (i = 0; i < seat->bar->title.buttons_l; i++) {
 					if (seat->pointer_button == seat->bar->title.buttons[i].btn
-					    && seat->pointer_x >= x + seat->bar->title.buttons[i].x1
-					    && seat->pointer_x < x + seat->bar->title.buttons[i].x2) {
+					    && ptr_x >= x + seat->bar->title.buttons[i].x1
+					    && ptr_x < x + seat->bar->title.buttons[i].x2) {
 						shell_command(seat->bar->title.buttons[i].command);
 						break;
 					}
@@ -729,8 +904,8 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 			for (i = 0; i < seat->bar->status.buttons_l; i++) {
 			
 				if (seat->pointer_button == seat->bar->status.buttons[i].btn
-				    && seat->pointer_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1 / buffer_scale
-				    && seat->pointer_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2 / buffer_scale) {
+				    && ptr_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1
+				    && ptr_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2) {
 					shell_command(seat->bar->status.buttons[i].command);
 					break;
 				}
@@ -758,13 +933,14 @@ pointer_axis_discrete(void *data, struct wl_pointer *pointer,
 	if (!seat->bar)
 		return;
 
-	uint32_t status_x = seat->bar->width / buffer_scale - TEXT_WIDTH(seat->bar->status.text, seat->bar->width, seat->bar->textpadding) / buffer_scale;
-	if (seat->pointer_x > status_x) {
+	uint32_t ptr_x = seat->pointer_x * seat->bar->scale;
+	uint32_t status_x = seat->bar->width - TEXT_WIDTH(seat->bar->font, seat->bar->status.text, seat->bar->width, seat->bar->textpadding);
+	if (ptr_x > status_x) {
 		/* Clicked on status */
 		for (i = 0; i < seat->bar->status.buttons_l; i++) {
 			if (btn == seat->bar->status.buttons[i].btn
-			    && seat->pointer_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1 / buffer_scale
-			    && seat->pointer_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2 / buffer_scale) {
+			    && ptr_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1
+			    && ptr_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2) {
 				shell_command(seat->bar->status.buttons[i].command);
 				break;
 			}
@@ -842,12 +1018,12 @@ show_bar(Bar *bar)
 		DIE("Could not create layer_surface");
 	zwlr_layer_surface_v1_add_listener(bar->layer_surface, &layer_surface_listener, bar);
 
-	zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, bar->height / buffer_scale);
+	zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, bar_height);
 	zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
 					 (bar->bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)
 					 | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
 					 | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-	zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar->height / buffer_scale);
+	zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar_height);
 	wl_surface_commit(bar->wl_surface);
 
 	bar->hidden = false;
@@ -858,6 +1034,8 @@ hide_bar(Bar *bar)
 {
 	zwlr_layer_surface_v1_destroy(bar->layer_surface);
 	wl_surface_destroy(bar->wl_surface);
+	bar->layer_surface = NULL;
+	bar->wl_surface = NULL;
 
 	bar->configured = false;
 	bar->hidden = true;
@@ -1015,10 +1193,123 @@ static const struct zdwl_ipc_output_v2_listener dwl_wm_output_listener = {
 };
 
 static void
+commit_bar_size(Bar *bar)
+{
+	if (!bar->layer_surface)
+		return;
+
+	zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, bar_height);
+	zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar_height);
+	bar->configured = false;
+	wl_surface_commit(bar->wl_surface);
+}
+
+/* Recompute the height shared by all bars. Returns true if it changed, in
+ * which case every bar has already been re-committed. */
+static bool
+update_bar_height(void)
+{
+	Bar *bar;
+	uint32_t h = 0;
+
+	wl_list_for_each(bar, &bar_list, link)
+		if (bar->font && bar->hmin > h)
+			h = bar->hmin;
+
+	if (!h || h == bar_height)
+		return false;
+	bar_height = h;
+
+	wl_list_for_each(bar, &bar_list, link)
+		commit_bar_size(bar);
+
+	return true;
+}
+
+/* Point a bar at the font/geometry for a scale, resizing it if it is up */
+static void
+bar_set_scale(Bar *bar, uint32_t scale)
+{
+	if (buffer_scale)
+		scale = buffer_scale;
+	if (scale < 1)
+		scale = 1;
+	if (bar->font && bar->scale == scale)
+		return;
+
+	ScaleCtx *ctx = get_scale_ctx(scale);
+	if (!ctx && !bar->font)
+		/* Never leave a bar without a font to draw with */
+		ctx = get_scale_ctx(1);
+	if (!ctx)
+		return;
+
+	bar->scale = ctx->scale;
+	bar->font = ctx->font;
+	bar->textpadding = ctx->textpadding;
+	bar->hmin = ctx->hmin;
+
+	if (!update_bar_height())
+		commit_bar_size(bar);
+}
+
+static void
+wl_output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y,
+		   int32_t physical_width, int32_t physical_height,
+		   int32_t subpixel, const char *make, const char *model,
+		   int32_t transform)
+{
+}
+
+static void
+wl_output_mode(void *data, struct wl_output *wl_output, uint32_t flags,
+	       int32_t width, int32_t height, int32_t refresh)
+{
+}
+
+static void
+wl_output_scale(void *data, struct wl_output *wl_output, int32_t scale)
+{
+	Bar *bar = (Bar *)data;
+
+	bar->pending_scale = scale > 0 ? (uint32_t)scale : 1;
+}
+
+static void
+wl_output_done(void *data, struct wl_output *wl_output)
+{
+	Bar *bar = (Bar *)data;
+
+	/* Scale can arrive before the font subsystem is up; setup_bar applies
+	 * the pending value in that case */
+	if (bar->font)
+		bar_set_scale(bar, bar->pending_scale);
+}
+
+static void
+wl_output_name_handler(void *data, struct wl_output *wl_output, const char *name)
+{
+}
+
+static void
+wl_output_description(void *data, struct wl_output *wl_output,
+		      const char *description)
+{
+}
+
+static const struct wl_output_listener wl_output_listener = {
+	.geometry = wl_output_geometry,
+	.mode = wl_output_mode,
+	.done = wl_output_done,
+	.scale = wl_output_scale,
+	.name = wl_output_name_handler,
+	.description = wl_output_description,
+};
+
+static void
 setup_bar(Bar *bar)
 {
-	bar->height = height * buffer_scale;
-	bar->textpadding = textpadding;
+	bar_set_scale(bar, bar->pending_scale);
 	bar->bottom = bottom;
 	bar->hidden = hidden;
 	bar->floating = false;
@@ -1061,7 +1352,12 @@ handle_global(void *data, struct wl_registry *registry,
 		if (!bar)
 			EDIE("calloc");
 		bar->registry_name = name;
-		bar->wl_output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+		bar->pending_scale = 1;
+		/* wl_output.scale needs version 2; name/description arrived in 4 */
+		bar->wl_output = wl_registry_bind(registry, name, &wl_output_interface,
+						 version < 4 ? version : 4);
+		if (version >= 2)
+			wl_output_add_listener(bar->wl_output, &wl_output_listener, bar);
 		if (run_display)
 			setup_bar(bar);
 		wl_list_insert(&bar_list, &bar->link);
@@ -1300,7 +1596,7 @@ parse_color(const char *str, pixman_color_t *clr)
 }
 
 static void
-parse_into_customtext(CustomText *ct, char *text)
+parse_into_customtext(struct fcft_font *font, CustomText *ct, char *text)
 {
 	ct->colors_l = ct->buttons_l = 0;
 
@@ -1510,16 +1806,19 @@ read_socket(void)
 		if (all) {
 			Bar *first = NULL;
 			wl_list_for_each(bar, &bar_list, link) {
-				if (first) {
+				/* Button offsets are font-relative, so they can
+				 * only be shared between equally scaled bars */
+				if (first && first->font == bar->font) {
 					copy_customtext(&first->status, &bar->status);
 				} else {
-					parse_into_customtext(&bar->status, wordend);
-					first = bar;
+					parse_into_customtext(bar->font, &bar->status, wordend);
+					if (!first)
+						first = bar;
 				}
 				bar->redraw = true;
 			}
 		} else {
-			parse_into_customtext(&bar->status, wordend);
+			parse_into_customtext(bar->font, &bar->status, wordend);
 			bar->redraw = true;
 		}
 	} else if (!strcmp(wordbeg, "title")) {
@@ -1528,16 +1827,19 @@ read_socket(void)
 		if (all) {
 			Bar *first = NULL;
 			wl_list_for_each(bar, &bar_list, link) {
-				if (first) {
+				/* Button offsets are font-relative, so they can
+				 * only be shared between equally scaled bars */
+				if (first && first->font == bar->font) {
 					copy_customtext(&first->title, &bar->title);
 				} else {
-					parse_into_customtext(&bar->title, wordend);
-					first = bar;
+					parse_into_customtext(bar->font, &bar->title, wordend);
+					if (!first)
+						first = bar;
 				}
 				bar->redraw = true;
 			}
 		} else {
-			parse_into_customtext(&bar->title, wordend);
+			parse_into_customtext(bar->font, &bar->title, wordend);
 			bar->redraw = true;
 		}
 	} else if (!strcmp(wordbeg, "show")) {
@@ -1914,13 +2216,11 @@ main(int argc, char **argv)
 	fcft_init(FCFT_LOG_COLORIZE_AUTO, 0, FCFT_LOG_CLASS_ERROR);
 	fcft_set_scaling_filter(FCFT_SCALING_FILTER_LANCZOS3);
 
-	unsigned int dpi = 96 * buffer_scale;
-	char buf[10];
-	snprintf(buf, sizeof buf, "dpi=%u", dpi);
-	if (!(font = fcft_from_name(1, (const char *[]) {fontstr}, buf)))
+	parse_fontstr();
+
+	/* Fail early if the font is unusable; bars load their own scale on demand */
+	if (!get_scale_ctx(buffer_scale ? buffer_scale : 1))
 		DIE("Could not load font");
-	textpadding = font->height / 2;
-	height = font->height / buffer_scale + vertical_padding * 2;
 
 	/* Configure tag names */
 	if (!ipc && !tags) {
@@ -2009,7 +2309,8 @@ main(int argc, char **argv)
 	if (ipc)
 		zdwl_ipc_manager_v2_destroy(dwl_wm);
 	
-	fcft_destroy(font);
+	for (uint32_t i = 0; i < scales_l; i++)
+		fcft_destroy(scales[i].font);
 	fcft_fini();
 	
 	wl_shm_destroy(shm);

@@ -1238,6 +1238,11 @@ bar_set_scale(Bar *bar, uint32_t scale)
 		return;
 
 	ScaleCtx *ctx = get_scale_ctx(scale);
+	if (!ctx)
+		/* fontconfig can fail transiently (cache being rebuilt by
+		 * another client, for example); the event loop retries until
+		 * this succeeds, so say something instead of failing silently */
+		fprintf(stderr, "dwlb: could not load font for scale %u, retrying\n", scale);
 	if (!ctx && !bar->font)
 		/* Never leave a bar without a font to draw with */
 		ctx = get_scale_ctx(1);
@@ -1916,6 +1921,7 @@ event_loop(void)
 
 	while (run_display) {
 		fd_set rfds;
+		struct timeval tv = { 1, 0 };
 		FD_ZERO(&rfds);
 		FD_SET(wl_fd, &rfds);
 		FD_SET(sock_fd, &rfds);
@@ -1924,7 +1930,7 @@ event_loop(void)
 
 		wl_display_flush(display);
 
-		if (select(MAX(sock_fd, wl_fd) + 1, &rfds, NULL, NULL, NULL) == -1) {
+		if (select(MAX(sock_fd, wl_fd) + 1, &rfds, NULL, NULL, &tv) == -1) {
 			if (errno == EINTR)
 				continue;
 			else
@@ -1940,6 +1946,13 @@ event_loop(void)
 			read_stdin();
 		
 		Bar *bar;
+		
+		/* If loading the font for a bar's output scale failed at startup,
+		 * the bar would otherwise stay at the wrong scale forever */
+		wl_list_for_each(bar, &bar_list, link)
+			if (bar->font)
+				bar_set_scale(bar, bar->pending_scale);
+		
 		wl_list_for_each(bar, &bar_list, link) {
 			if (bar->redraw) {
 				if (!bar->hidden)

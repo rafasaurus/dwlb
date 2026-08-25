@@ -152,6 +152,8 @@ typedef struct {
 
 	bool configured;
 	uint32_t width, height;
+	/* last configure's logical size; width/height are these times scale */
+	uint32_t logical_w, logical_h;
 	uint32_t textpadding;
 	/* scale of the output this bar lives on, and the font sized for it */
 	uint32_t scale, pending_scale;
@@ -676,6 +678,8 @@ layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
 	
 	Bar *bar = (Bar *)data;
 
+	bar->logical_w = w;
+	bar->logical_h = h;
 	w = w * bar->scale;
 	h = h * bar->scale;
 	
@@ -1253,6 +1257,17 @@ bar_set_scale(Bar *bar, uint32_t scale)
 	bar->font = ctx->font;
 	bar->textpadding = ctx->textpadding;
 	bar->hmin = ctx->hmin;
+
+	/* The compositor only reconfigures when the logical size changes, so a
+	 * scale switch has to recompute the buffer size from the last
+	 * configure and redraw on its own */
+	if (bar->configured) {
+		bar->width = bar->logical_w * bar->scale;
+		bar->height = bar->logical_h * bar->scale;
+		bar->stride = bar->width * 4;
+		bar->bufsize = bar->stride * bar->height;
+		bar->redraw = true;
+	}
 
 	if (!update_bar_height())
 		commit_bar_size(bar);
